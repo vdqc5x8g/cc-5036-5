@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>水体流场三维设计查看器</title>
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <div>
+            <h1>水体流场三维设计查看器</h1>
+            <p class="brand-sub">真实积分 · 屏幕/空间分离拾取 · 解析参考校验</p>
+          </div>
+        </div>
+        <div class="field-switch" id="field-switch" role="group" aria-label="合成场选择"></div>
+        <div class="top-actions">
+          <button class="btn" id="import-btn" type="button">导入向量场 JSON</button>
+          <input type="file" id="import-input" accept=".json,application/json" hidden />
+          <button class="btn ghost" id="recenter-btn" type="button">重新居中</button>
+        </div>
+      </header>
+
+      <main class="layout">
+        <aside class="panel panel-left" id="left-panel" aria-label="场数据与种子"></aside>
+        <section class="viewport" id="viewport">
+          <div class="viewport-hud hud-top-left" id="compute-hud"></div>
+          <div class="viewport-hud hud-top-right" id="camera-hud"></div>
+          <div class="legend-card" id="legend"></div>
+          <div class="viewport-hint" id="viewport-hint"></div>
+          <div class="tooltip" id="tooltip" hidden></div>
+          <div class="candidate-popup" id="candidate-popup" hidden></div>
+          <div class="empty-hint" id="empty-hint">
+            <strong>点击视口放置种子</strong>
+            <span>种子即用当前参数真实积分流线；拖动种子可实时更新。</span>
+          </div>
+        </section>
+        <aside class="panel panel-right" id="right-panel" aria-label="求值参数与校验"></aside>
+      </main>
+
+      <div class="toast" id="toast" hidden></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

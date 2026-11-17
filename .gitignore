@@ -23,3 +23,7 @@ __pycache__/
 *.log
 .env
 .env.*
+
+# Playwright artifacts
+test-results/
+playwright-report/
