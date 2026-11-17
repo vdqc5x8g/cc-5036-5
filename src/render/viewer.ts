@@ -3,7 +3,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { Line2 } from 'three/examples/jsm/lines/Line2.js';
 import { LineGeometry } from 'three/examples/jsm/lines/LineGeometry.js';
 import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
-import { VectorGrid } from '../core/grid';
+import type { FieldBackend, FieldMaskBox } from '../core/fieldProtocol';
 import { StreamlineResult, Vec3 } from '../core/types';
 import { ColorScale, colorForValue } from './colormap';
 import { SceneHandles, simToThree, threeToSim, toVec3 } from './scene';
@@ -26,6 +26,7 @@ export interface ViewerOptions {
 }
 
 const MISSING_COLOR = 0xc2410c;
+const MISSING_CHUNK_COLOR = 0xeab308;
 const SOLID_COLOR = 0x64748b;
 const OUTLINE_COLOR = 0x2f4a63;
 
@@ -185,19 +186,25 @@ export class Viewer {
     this.needsRender = true;
   }
 
-  /** Rebuild field furniture (bounds, missing volumes, outline). */
-  setField(grid: VectorGrid) {
+  /** Rebuild field furniture (bounds, unavailable volumes, outline). */
+  setField(backend: FieldBackend) {
     this.clearGroup(this.handles.fieldGroup, true);
     this.axisLabels = [];
     this.addReferenceGround();
-    this.rebuildFieldDecor(grid);
-    this.frameCamera(grid);
+    this.rebuildFieldDecor(backend);
+    this.frameCamera(backend);
     this.reflowStreamlines();
     this.needsRender = true;
   }
 
-  private rebuildFieldDecor(grid: VectorGrid) {
-    const ext = grid.extent;
+  /**
+   * Unavailable regions come from the backend's `maskBoxes()`, which already
+   * merges contiguous cells against the real axis coordinates. That keeps
+   * non-uniform grids and absent chunks geometrically honest without this
+   * layer knowing the storage layout.
+   */
+  private rebuildFieldDecor(backend: FieldBackend) {
+    const ext = backend.extent;
     const size = new THREE.Vector3(
       ext.max.x - ext.min.x,
       ext.max.z - ext.min.z,
@@ -222,46 +229,35 @@ export class Viewer {
     // densely because it would obscure streamlines.
 
     const maskGroup = new THREE.Group();
-    const missingVoxels = this.collectCells(grid, (c) => grid.cellMissing[c] === 1);
-    const solidVoxels = this.collectCells(grid, (c) => grid.cellSolid[c] === 1);
-    if (missingVoxels.length) {
-      const m = this.buildVoxelMesh(grid, missingVoxels, MISSING_COLOR, 0.05, 0xfb923c);
-      m.userData.maskKind = 'missing';
+    const boxes = backend.maskBoxes();
+    const byKind: Record<FieldMaskBox['kind'], FieldMaskBox[]> = {
+      missing: [],
+      solid: [],
+      'missing-chunk': [],
+    };
+    for (const box of boxes) byKind[box.kind].push(box);
+
+    const addBoxes = (kind: FieldMaskBox['kind'], items: FieldMaskBox[], color: number, opacity: number, edgeColor: number) => {
+      if (!items.length) return;
+      const m = this.buildBoxMesh(items, color, opacity, edgeColor);
+      m.userData.maskKind = kind;
       maskGroup.add(m);
-    }
-    if (solidVoxels.length) {
-      const m = this.buildVoxelMesh(grid, solidVoxels, SOLID_COLOR, 0.09, 0x94a3b8);
-      m.userData.maskKind = 'solid';
-      maskGroup.add(m);
-    }
+    };
+    addBoxes('missing', byKind.missing, MISSING_COLOR, 0.05, 0xfb923c);
+    addBoxes('missing-chunk', byKind['missing-chunk'], MISSING_CHUNK_COLOR, 0.12, 0xfacc15);
+    addBoxes('solid', byKind.solid, SOLID_COLOR, 0.09, 0x94a3b8);
     this.maskGroup = maskGroup;
     this.handles.fieldGroup.add(maskGroup);
   }
 
-  private collectCells(grid: VectorGrid, test: (cellIndex: number) => boolean): [number, number, number][] {
-    const out: [number, number, number][] = [];
-    const [cnx, cny, cnz] = grid.cellDims;
-    for (let k = 0; k < cnz; k++) {
-      for (let j = 0; j < cny; j++) {
-        for (let i = 0; i < cnx; i++) {
-          const c = i + cnx * (j + cny * k);
-          if (test(c)) out.push([i, j, k]);
-        }
-      }
-    }
-    return out;
-  }
-
-  private buildVoxelMesh(
-    grid: VectorGrid,
-    cells: [number, number, number][],
+  private buildBoxMesh(
+    boxes: FieldMaskBox[],
     color: number,
     opacity: number,
     edgeColor: number,
   ): THREE.Group {
     const group = new THREE.Group();
-    const { spacing } = grid.spec;
-    const geo = new THREE.BoxGeometry(spacing.x * 0.94, spacing.z * 0.94, spacing.y * 0.94);
+    const geo = new THREE.BoxGeometry(1, 1, 1);
     const mat = new THREE.MeshBasicMaterial({
       color,
       transparent: true,
@@ -271,15 +267,23 @@ export class Viewer {
       // Additive fill stays legible as a volume without a solid block hiding streamlines behind it.
       blending: THREE.AdditiveBlending,
     });
-    const mesh = new THREE.InstancedMesh(geo, mat, Math.max(1, cells.length));
+    const mesh = new THREE.InstancedMesh(geo, mat, Math.max(1, boxes.length));
     const dummy = new THREE.Object3D();
-    for (let idx = 0; idx < cells.length; idx++) {
-      const [i, j, k] = cells[idx];
-      dummy.position.copy(simToThree(grid.cellCenter(i, j, k)));
+    for (let idx = 0; idx < boxes.length; idx++) {
+      const box = boxes[idx];
+      // simToThree swaps y/z, so derive the three-space extent from both corners.
+      const lo = simToThree(box.min);
+      const hi = simToThree(box.max);
+      dummy.position.set((lo.x + hi.x) / 2, (lo.y + hi.y) / 2, (lo.z + hi.z) / 2);
+      dummy.scale.set(
+        Math.max(1e-4, Math.abs(hi.x - lo.x) * 0.96),
+        Math.max(1e-4, Math.abs(hi.y - lo.y) * 0.96),
+        Math.max(1e-4, Math.abs(hi.z - lo.z) * 0.96),
+      );
       dummy.updateMatrix();
       mesh.setMatrixAt(idx, dummy.matrix);
     }
-    mesh.count = cells.length;
+    mesh.count = boxes.length;
     mesh.instanceMatrix.needsUpdate = true;
     group.add(mesh);
 
@@ -287,11 +291,18 @@ export class Viewer {
     const edgeGeo = new THREE.EdgesGeometry(geo);
     const edgeMat = new THREE.LineBasicMaterial({ color: edgeColor, transparent: true, opacity: 0.55 });
     const maxEdges = 3000;
-    const stride = Math.max(1, Math.ceil(cells.length / maxEdges));
-    for (let idx = 0; idx < cells.length; idx += stride) {
-      const [i, j, k] = cells[idx];
+    const stride = Math.max(1, Math.ceil(boxes.length / maxEdges));
+    for (let idx = 0; idx < boxes.length; idx += stride) {
+      const box = boxes[idx];
+      const lo = simToThree(box.min);
+      const hi = simToThree(box.max);
       const seg = new THREE.LineSegments(edgeGeo, edgeMat);
-      seg.position.copy(simToThree(grid.cellCenter(i, j, k)));
+      seg.position.set((lo.x + hi.x) / 2, (lo.y + hi.y) / 2, (lo.z + hi.z) / 2);
+      seg.scale.set(
+        Math.max(1e-4, Math.abs(hi.x - lo.x) * 0.96),
+        Math.max(1e-4, Math.abs(hi.y - lo.y) * 0.96),
+        Math.max(1e-4, Math.abs(hi.z - lo.z) * 0.96),
+      );
       group.add(seg);
     }
     edgeGeo.userData.shared = true;
@@ -300,8 +311,8 @@ export class Viewer {
     return group;
   }
 
-  frameCamera(grid: VectorGrid) {
-    const ext = grid.extent;
+  frameCamera(backend: FieldBackend) {
+    const ext = backend.extent;
     const centre = simToThree({
       x: (ext.min.x + ext.max.x) / 2,
       y: (ext.min.y + ext.max.y) / 2,

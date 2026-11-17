@@ -1,4 +1,6 @@
-import { FieldPayload, normalizeImport, VectorGrid, copyPayloadForWorker } from '../core/grid';
+import { normalizeImportInput } from '../core/importAdapter';
+import { createFieldBackend } from '../core/fieldFactory';
+import type { FieldBackend, FieldInput } from '../core/fieldProtocol';
 import {
   DEFAULT_PARAMS,
   HazardProbe,
@@ -24,6 +26,7 @@ import {
   vec3,
 } from '../core/types';
 import { runValidation } from '../core/validation';
+import { makeChunkedDemoField } from '../core/chunkedDemo';
 import { ColormapName } from '../render/colormap';
 import { WorkerRequest, WorkerResponse } from '../workers/integrate.worker';
 
@@ -50,8 +53,10 @@ export interface ComputeStatus {
 }
 
 export interface AppState {
-  fieldPayload: FieldPayload;
-  grid: VectorGrid;
+  /** Raw description the active backend was built from (dense, chunked or legacy). */
+  fieldInput: FieldInput;
+  /** Active backend (dense, chunked or legacy adapter) used by every sampler. */
+  backend: FieldBackend;
   fieldEpoch: number;
   seeds: SeedRecord[];
   selectedSeedId: string | null;
@@ -72,14 +77,14 @@ export interface AppState {
 }
 
 export type Listener = (state: AppState) => void;
-export type ComputeRunner = (grid: VectorGrid) => void;
+export type ComputeRunner = (backend: FieldBackend) => void;
 
 export class AppStore {
   private state: AppState;
   private listeners = new Set<Listener>();
   private worker: Worker | null = null;
   private requestSeq = 0;
-  private pendingByRequest = new Map<number, { seedId: string; generation: number; epoch: number }>();
+  private pendingByRequest = new Map<number, { seedIds: string[]; generation: number; epoch: number }>();
   private generation = 0;
   /** Seeds whose geometry changed; only these need re-integration. */
   private dirty = new Set<string>();
@@ -89,22 +94,22 @@ export class AppStore {
   private toastSeq = 0;
   private inlineFallback = false;
 
-  constructor(fieldPayload: FieldPayload) {
-    this.state = this.initialState(fieldPayload);
+  constructor(fieldInput: FieldInput) {
+    this.state = this.initialState(fieldInput);
     this.startWorker();
     this.runHazardProbesSoon();
   }
 
-  private initialState(fieldPayload: FieldPayload): AppState {
-    const grid = new VectorGrid(fieldPayload);
+  private initialState(fieldInput: FieldInput): AppState {
+    const backend = createFieldBackend(fieldInput);
     const fieldKind: SyntheticFieldId | 'imported' = SYNTHETIC_FIELD_IDS.includes(
-      fieldPayload.meta.id as SyntheticFieldId,
+      backend.meta.id as SyntheticFieldId,
     )
-      ? (fieldPayload.meta.id as SyntheticFieldId)
+      ? (backend.meta.id as SyntheticFieldId)
       : 'imported';
     return {
-      fieldPayload,
-      grid,
+      fieldInput,
+      backend,
       fieldEpoch: 0,
       seeds: [],
       selectedSeedId: null,
@@ -160,7 +165,7 @@ export class AppStore {
       this.worker = new Worker(new URL('../workers/integrate.worker.ts', import.meta.url), { type: 'module' });
       this.worker.onmessage = (ev: MessageEvent<WorkerResponse>) => this.onWorkerMessage(ev.data);
       this.worker.onerror = (ev) => {
-        this.showToast(`积分线程出错：${ev.message || '未知错误'}`, 'error');
+        this.onWorkerFailure(ev.message || '未知错误');
         this.inlineFallback = true;
       };
       this.postInit();
@@ -173,12 +178,11 @@ export class AppStore {
   private postInit() {
     if (!this.worker) return;
     const requestId = ++this.requestSeq;
-    const payload = copyPayloadForWorker(this.state.fieldPayload);
-    (payload as FieldPayload & { epoch: number }).epoch = this.state.fieldEpoch;
     this.worker.postMessage({
       type: 'init',
       requestId,
-      field: payload,
+      field: this.state.fieldInput,
+      epoch: this.state.fieldEpoch,
     } satisfies WorkerRequest);
   }
 
@@ -216,12 +220,73 @@ export class AppStore {
       }
       case 'error': {
         this.workerBusy = false;
-        this.setState({ status: { ...this.state.status, error: msg.message, active: 0 } });
-        this.showToast(`计算失败：${msg.message}`, 'error');
+        this.onWorkerFailure(msg.message);
         this.flushQueuedSynth();
         break;
       }
     }
+  }
+
+  /**
+   * A failed request must never leave seeds stuck in "computing": the failure
+   * is written back onto the affected seed records so streamline interaction
+   * shows a terminal reason instead of spinning forever. The failure is not
+   * swallowed into a default velocity or a fabricated trajectory.
+   */
+  private onWorkerFailure(message: string) {
+    const failed = new Set(
+      [...this.pendingByRequest.values()]
+        .filter((p) => p.generation === this.generation)
+        .flatMap((p) => p.seedIds),
+    );
+    this.pendingByRequest.clear();
+    const seeds = failed.size
+      ? this.state.seeds.map((seed) =>
+          failed.has(seed.id)
+            ? {
+                ...seed,
+                computing: false,
+                lastStop: { forward: 'numerical' as StopReason, backward: null },
+                result: seed.result
+                  ? {
+                      ...seed.result,
+                      stopDetail: { ...seed.result.stopDetail, forward: `计算失败：${message}` },
+                    }
+                  : null,
+              }
+            : seed,
+        )
+      : this.state.seeds;
+    this.setState({ seeds, status: { ...this.state.status, error: message, active: 0 } });
+    this.showToast(`计算失败：${message}`, 'error');
+  }
+
+  /** Test seam: exercise the failure feedback path without killing the worker. */
+  onWorkerFailureForTest(message: string): SeedRecord[] {
+    const targets = this.state.seeds.filter((seed) => seed.computing);
+    // If nothing is in flight, hold every seed as pending so the test exercises
+    // the real write-back path rather than a no-op.
+    if (targets.length === 0) {
+      const ids = this.state.seeds.map((seed) => seed.id);
+      const requestId = -1;
+      this.pendingByRequest.set(requestId, {
+        seedIds: ids,
+        generation: this.generation,
+        epoch: this.state.fieldEpoch,
+      });
+      this.state = {
+        ...this.state,
+        seeds: this.state.seeds.map((seed) => ({ ...seed, computing: true })),
+      };
+      this.onWorkerFailure(message);
+      this.flushQueuedSynth();
+      return this.state.seeds;
+    }
+    const ids = targets.map((seed) => seed.id);
+    this.pendingByRequest.set(-1, { seedIds: ids, generation: this.generation, epoch: this.state.fieldEpoch });
+    this.onWorkerFailure(message);
+    this.flushQueuedSynth();
+    return this.state.seeds;
   }
 
   private flushQueuedSynth() {
@@ -238,31 +303,41 @@ export class AppStore {
   }
 
   loadImportedField(raw: unknown) {
-    const payload = normalizeImport(raw);
-    this.replaceField(payload, 'imported');
+    // Explicit per-axis `axes` select a non-uniform dense backend; legacy
+    // origin/spacing/dims files keep their adapter path.
+    const input = normalizeImportInput(raw);
+    this.replaceField(input, 'imported');
   }
 
-  private replaceField(payload: FieldPayload, kind: SyntheticFieldId | 'imported') {
+  loadChunkedDemo() {
+    this.replaceField(makeChunkedDemoField(), 'imported');
+  }
+
+  /** Load a pre-built input directly (used for the chunked demo field). */
+  loadFieldInput(input: FieldInput, kind: SyntheticFieldId | 'imported' = 'imported') {
+    this.replaceField(input, kind);
+  }
+
+  private replaceField(input: FieldInput, kind: SyntheticFieldId | 'imported') {
     // Bump generation first so every in-flight result is invalidated.
     this.generation++;
     const epoch = this.state.fieldEpoch + 1;
-    const grid = new VectorGrid(payload);
-    grid.epoch = epoch;
-    (payload as FieldPayload & { epoch: number }).epoch = epoch;
+    const backend = createFieldBackend(input);
+    backend.epoch = epoch;
     this.pendingByRequest.clear();
     this.validationJob = null;
     this.dirty.clear();
     this.state = {
       ...this.state,
-      fieldPayload: payload,
-      grid,
+      fieldInput: input,
+      backend,
       fieldEpoch: epoch,
       fieldKind: kind,
       seeds: [],
       selectedSeedId: null,
       hazards: null,
       validation: null,
-      colorBy: payload.scalars['speed'] ? '速度' : this.state.colorBy,
+      colorBy: backend.scalarRange('speed') ? '速度' : this.state.colorBy,
       status: { ...this.state.status, active: 0, error: null, generation: this.generation },
     };
     this.emit();
@@ -273,11 +348,11 @@ export class AppStore {
   // ---- Seeds ----
 
   addSeed(position: Vec3, opts: { allowRelocate?: boolean } = {}): SeedRecord {
-    const grid = this.state.grid;
+    const backend = this.state.backend;
     let p = position;
-    if (!grid.isInsideData(p)) {
+    if (!backend.isInsideData(p)) {
       if (!opts.allowRelocate) {
-        const snapped = grid.nearestValidPoint(p);
+        const snapped = backend.nearestValidPoint(p);
         this.showToast(
           snapped
             ? '种子落在缺测或网格外，已吸附到最近的可用单元中心。'
@@ -336,10 +411,10 @@ export class AppStore {
   }
 
   moveSeed(id: string, position: Vec3) {
-    const grid = this.state.grid;
+    const backend = this.state.backend;
     let p = position;
-    if (!grid.isInsideData(p)) {
-      const snapped = grid.nearestValidPoint(p);
+    if (!backend.isInsideData(p)) {
+      const snapped = backend.nearestValidPoint(p);
       if (!snapped) {
         this.showToast('拖动位置没有可用场数据，种子保持在最后一个有效位置。', 'warn');
         return;
@@ -374,9 +449,9 @@ export class AppStore {
   removeSeed(id: string) {
     this.generation++;
     const seeds = this.state.seeds.filter((s) => s.id !== id);
-    this.pendingByRequest.delete(
-      [...this.pendingByRequest.entries()].find(([, v]) => v.seedId === id)?.[0] ?? -1,
-    );
+    for (const [requestId, pending] of this.pendingByRequest) {
+      if (pending.seedIds.includes(id)) this.pendingByRequest.delete(requestId);
+    }
     this.setState({
       seeds,
       selectedSeedId: this.state.selectedSeedId === id ? null : this.state.selectedSeedId,
@@ -471,9 +546,11 @@ export class AppStore {
 
     const requestId = ++this.requestSeq;
     const generation = this.generation;
-    for (const job of jobs) {
-      this.pendingByRequest.set(requestId, { seedId: job.seedId, generation, epoch: this.state.fieldEpoch });
-    }
+    this.pendingByRequest.set(requestId, {
+      seedIds: jobs.map((job) => job.seedId),
+      generation,
+      epoch: this.state.fieldEpoch,
+    });
     this.workerBusy = true;
     this.state = {
       ...this.state,
@@ -492,7 +569,7 @@ export class AppStore {
   private runDirtyInline(jobs: { seedId: string; seed: Vec3; params: IntegratorParams; version: number; color: string; label: string }[]) {
     const generation = this.generation;
     const results = jobs.map((job) =>
-      integrateStreamline(this.state.grid, job.seed, job.params, {
+      integrateStreamline(this.state.backend, job.seed, job.params, {
         seedId: job.seedId,
         version: job.version,
         color: job.color,
@@ -573,7 +650,7 @@ export class AppStore {
     } else {
       const report = runValidation({
         fieldKind: this.state.fieldKind,
-        grid: this.state.grid,
+        backend: this.state.backend,
         params: this.state.params,
         seeds,
         toleranceMeters: tolerance,
@@ -584,8 +661,8 @@ export class AppStore {
   }
 
   private validationSeeds(): Vec3[] {
-    const grid = this.state.grid;
-    const ext = grid.extent;
+    const backend = this.state.backend;
+    const ext = backend.extent;
     const seeds: Vec3[] = [];
     const choose = (fx: number, fy: number, fz: number) =>
       vec3(
@@ -601,13 +678,12 @@ export class AppStore {
     } else {
       seeds.push(choose(0.2, 0.3, 0.4), choose(0.55, 0.5, 0.55));
     }
-    void grid;
     return seeds;
   }
 
   private hazardProbes(): HazardProbe[] {
     const kind = this.state.fieldKind;
-    if (kind === 'imported') return maskHazardProbes(this.state.grid);
+    if (kind === 'imported') return maskHazardProbes(this.state.backend);
     const { a, z0 } = HYPERBOLIC_PARAMS;
     if (kind === 'hyperbolic') {
       return [
@@ -634,7 +710,7 @@ export class AppStore {
   runHazardProbesNow() {
     if (this.inlineFallback) {
       const probes = this.hazardProbes();
-      this.setState({ hazards: runHazardChecks(this.state.grid, this.state.params, probes) });
+      this.setState({ hazards: runHazardChecks(this.state.backend, this.state.params, probes) });
       return;
     }
     if (!this.worker || this.workerBusy) {

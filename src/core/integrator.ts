@@ -1,4 +1,4 @@
-import { VectorGrid } from './grid';
+import { FieldBackend } from './fieldProtocol';
 import {
   add,
   distance,
@@ -6,15 +6,46 @@ import {
   IntegrationDirectionResult,
   IntegrationStats,
   IntegratorParams,
+  isBoundedStop,
   length,
   Sample,
+  SampleReason,
   scale,
+  STOP_CATEGORY,
   StopReason,
   StreamlineResult,
   sub,
   Vec3,
   vec3,
 } from './types';
+
+/** Translate an unavailable-sample reason into a bounded trajectory stop. */
+export function stopFromSampleReason(reason: SampleReason): StopReason {
+  switch (reason) {
+    case 'missing-chunk':
+      return 'missing-chunk';
+    case 'missing-data':
+      return 'missing-data';
+    case 'solid':
+      return 'solid';
+    default:
+      return 'out-of-bounds';
+  }
+}
+
+export function describeSampleReason(reason: SampleReason): string {
+  switch (reason) {
+    case 'missing-chunk':
+      return '进入缺块区域';
+    case 'missing-data':
+      return '进入缺测单元';
+    case 'solid':
+      return '接触固体/分离面';
+    default:
+      return '越出网格边界';
+  }
+}
+
 
 export const DEFAULT_PARAMS: IntegratorParams = {
   stepLength: 0.35,
@@ -39,16 +70,16 @@ const MIN_SUBSTEP = 1e-7;
  */
 class FlowSampler {
   evals = 0;
-  private readonly grid: VectorGrid;
+  private readonly backend: FieldBackend;
 
-  constructor(grid: VectorGrid) {
-    this.grid = grid;
+  constructor(backend: FieldBackend) {
+    this.backend = backend;
   }
 
   /** Unit direction of travel at p, signed by integration direction. */
-  dir(p: Vec3, sign: 1 | -1): { ok: boolean; reason: 'ok' | 'out-of-bounds' | 'missing-data' | 'solid'; d: Vec3; speed: number } {
+  dir(p: Vec3, sign: 1 | -1): { ok: boolean; reason: SampleReason; d: Vec3; speed: number } {
     this.evals++;
-    const s = this.grid.sample(p);
+    const s = this.backend.sample(p);
     if (!s.ok) {
       return { ok: false, reason: s.reason, d: vec3(), speed: 0 };
     }
@@ -60,7 +91,7 @@ class FlowSampler {
   }
 
   /** RK4 over one substep of arc length h starting at p with unit travel direction d0. */
-  rk4(p: Vec3, d0: Vec3, h: number, sign: 1 | -1): { p: Vec3; ok: boolean; reason: 'ok' | 'out-of-bounds' | 'missing-data' | 'solid' } {
+  rk4(p: Vec3, d0: Vec3, h: number, sign: 1 | -1): { p: Vec3; ok: boolean; reason: SampleReason } {
     const k1 = d0;
     const k2r = this.dir(add(p, scale(k1, h / 2)), sign);
     if (!k2r.ok) return { p: add(p, scale(k1, h)), ok: false, reason: k2r.reason };
@@ -97,7 +128,7 @@ function makeSample(
  * Returns 0 when no positive step is legal (the point sits on the domain boundary).
  */
 function maxAdmissibleSubstep(
-  grid: VectorGrid,
+  backend: FieldBackend,
   p: Vec3,
   dir: Vec3,
   hMax: number,
@@ -109,7 +140,7 @@ function maxAdmissibleSubstep(
   for (let i = 0; i < 24; i++) {
     const mid = 0.5 * (lo + hi);
     if (mid <= MIN_SUBSTEP) return 0;
-    const trial = grid.sample(add(p, scale(dir, mid)));
+    const trial = backend.sample(add(p, scale(dir, mid)));
     // A single Euler probe is sufficient to reject out-of-domain midpoints; the caller
     // re-runs full RK4 on the accepted h afterwards.
     if (trial.ok) lo = mid;
@@ -123,15 +154,15 @@ function maxAdmissibleSubstep(
 interface DirectionOptions {
   direction: 1 | -1;
   params: IntegratorParams;
-  grid: VectorGrid;
+  backend: FieldBackend;
 }
 
 function integrateDirection(
   seed: Vec3,
   opts: DirectionOptions,
 ): IntegrationDirectionResult {
-  const { direction, params, grid } = opts;
-  const sampler = new FlowSampler(grid);
+  const { direction, params, backend } = opts;
+  const sampler = new FlowSampler(backend);
   const samples: Sample[] = [];
   const forward = direction > 0;
   const stopDetailPrefix = forward ? '正向' : '反向';
@@ -140,6 +171,8 @@ function integrateDirection(
     samples,
     stop: 'ok',
     stopDetail: '',
+    category: 'completed',
+    bounded: true,
     steps: 0,
     evals: 0,
     substepCount: 0,
@@ -150,10 +183,12 @@ function integrateDirection(
     arc: 0,
   };
 
-  const seedSample = grid.sample(seed);
+  const seedSample = backend.sample(seed);
   if (!seedSample.ok) {
     result.stop = 'seed-invalid';
-    result.stopDetail = `${stopDetailPrefix}种子位于${seedSample.reason === 'missing-data' ? '缺测' : seedSample.reason === 'solid' ? '固体' : '网格范围外'}区域，无法积分。`;
+    result.category = STOP_CATEGORY['seed-invalid'];
+    result.bounded = isBoundedStop('seed-invalid');
+    result.stopDetail = `${stopDetailPrefix}种子位于${describeSampleReason(seedSample.reason)}，无法积分。`;
     result.minStep = 0;
     return result;
   }
@@ -161,6 +196,8 @@ function integrateDirection(
   const d0 = sampler.dir(seed, direction);
   if (!d0.ok || d0.speed < params.stagnationSpeed) {
     result.stop = 'stagnation';
+    result.category = STOP_CATEGORY.stagnation;
+    result.bounded = isBoundedStop('stagnation');
     result.stopDetail = `${stopDetailPrefix}种子处速度 ${d0.speed.toExponential(2)} m/s 低于静止阈值 ${params.stagnationSpeed.toExponential(2)} m/s。`;
     result.minStep = 0;
     samples.push(makeSample(seed, seedSample.v, 0, 0, seedSample.scalars));
@@ -183,10 +220,15 @@ function integrateDirection(
   const stopWith = (reason: StopReason, detail: string) => {
     result.stop = reason;
     result.stopDetail = detail;
+    result.category = STOP_CATEGORY[reason];
+    result.bounded = isBoundedStop(reason);
     result.evals = sampler.evals;
     result.minStep = Number.isFinite(result.minStep) ? result.minStep : 0;
     return result;
   };
+
+  const stopForBoundary = (reason: SampleReason, detail: string) =>
+    stopWith(stopFromSampleReason(reason), detail);
 
   for (let stepIndex = 0; stepIndex < maxSteps; stepIndex++) {
     if (s >= params.maxArcLength - 1e-12) {
@@ -201,11 +243,11 @@ function integrateDirection(
     }
 
     let h = hGoal;
-    let accepted: { p: Vec3; ok: boolean; reason: 'ok' | 'out-of-bounds' | 'missing-data' | 'solid' } | null = null;
+    let accepted: { p: Vec3; ok: boolean; reason: SampleReason } | null = null;
     let acceptedH = h;
     let halvings = 0;
     let reachedStagnation = false;
-    let boundaryReason: 'ok' | 'out-of-bounds' | 'missing-data' | 'solid' | null = null;
+    let boundaryReason: SampleReason | null = null;
 
     for (; halvings <= params.maxSubsteps; halvings++) {
       const trial = sampler.rk4(p, dir, h, direction);
@@ -213,14 +255,13 @@ function integrateDirection(
         // A substage left the valid domain. Find the largest admissible sub-step by
         // bisection; if no positive step fits, the streamline is on the boundary.
         boundaryReason = trial.reason;
-        const found = maxAdmissibleSubstep(grid, p, dir, h, direction);
+        const found = maxAdmissibleSubstep(backend, p, dir, h, direction);
         if (found <= MIN_SUBSTEP || found < hGoal * 1e-4) {
           result.substepLimitHits++;
-          const reason: StopReason =
-            boundaryReason === 'missing-data' ? 'missing-data' : boundaryReason === 'solid' ? 'solid' : 'out-of-bounds';
-          const wording =
-            boundaryReason === 'missing-data' ? '进入缺测单元' : boundaryReason === 'solid' ? '接触固体/分离面' : '越出网格边界';
-          return stopWith(reason, `${directionWord}在弧长 ${s.toFixed(2)} m 处${wording}（步长降为 ${found.toExponential(2)} m 仍不合法），已停止。`);
+          return stopForBoundary(
+            trial.reason,
+            `${directionWord}在弧长 ${s.toFixed(2)} m 处${describeSampleReason(trial.reason)}（步长降为 ${found.toExponential(2)} m 仍不合法），已停止。`,
+          );
         }
         h = found;
         result.substepCount++;
@@ -230,14 +271,13 @@ function integrateDirection(
       const endDir = sampler.dir(trial.p, direction);
       if (!endDir.ok) {
         boundaryReason = endDir.reason;
-        const found = maxAdmissibleSubstep(grid, p, dir, h, direction);
+        const found = maxAdmissibleSubstep(backend, p, dir, h, direction);
         if (found <= MIN_SUBSTEP || found < hGoal * 1e-4) {
           result.substepLimitHits++;
-          const reason: StopReason =
-            boundaryReason === 'missing-data' ? 'missing-data' : boundaryReason === 'solid' ? 'solid' : 'out-of-bounds';
-          const wording =
-            boundaryReason === 'missing-data' ? '进入缺测单元' : boundaryReason === 'solid' ? '接触固体/分离面' : '越出网格边界';
-          return stopWith(reason, `${directionWord}在弧长 ${s.toFixed(2)} m 处${wording}，已停止。`);
+          return stopForBoundary(
+            endDir.reason,
+            `${directionWord}在弧长 ${s.toFixed(2)} m 处${describeSampleReason(endDir.reason)}，已停止。`,
+          );
         }
         h = found;
         result.substepCount++;
@@ -272,11 +312,10 @@ function integrateDirection(
     if (!accepted) {
       result.substepLimitHits++;
       if (boundaryReason) {
-        const reason: StopReason =
-          boundaryReason === 'missing-data' ? 'missing-data' : boundaryReason === 'solid' ? 'solid' : 'out-of-bounds';
-        const wording =
-          boundaryReason === 'missing-data' ? '进入缺测单元' : boundaryReason === 'solid' ? '接触固体/分离面' : '越出网格边界';
-        return stopWith(reason, `${directionWord}在弧长 ${s.toFixed(2)} m 处${wording}，已停止。`);
+        return stopForBoundary(
+          boundaryReason,
+          `${directionWord}在弧长 ${s.toFixed(2)} m 处${describeSampleReason(boundaryReason)}，已停止。`,
+        );
       }
       return stopWith('numerical', `${directionWord}在弧长 ${s.toFixed(2)} m 处无法满足步长细分容差，已停止以避免无界计算。`);
     }
@@ -300,11 +339,11 @@ function integrateDirection(
     result.maxStep = Math.max(result.maxStep, segLength);
     result.arc = s;
 
-    const end = grid.sample(p);
+    const end = backend.sample(p);
     if (!end.ok) {
-      return stopWith(
-        end.reason === 'missing-data' ? 'missing-data' : end.reason === 'solid' ? 'solid' : 'out-of-bounds',
-        `${directionWord}在弧长 ${s.toFixed(2)} m 处${end.reason === 'missing-data' ? '进入缺测单元' : end.reason === 'solid' ? '接触固体/分离面' : '越出网格边界'}，已停止。`,
+      return stopForBoundary(
+        end.reason,
+        `${directionWord}在弧长 ${s.toFixed(2)} m 处${describeSampleReason(end.reason)}，已停止。`,
       );
     }
     if (end.speed < params.stagnationSpeed) {
@@ -362,18 +401,18 @@ function integrateDirection(
 
 /** Integrate a streamline through a seed. Handles both directions. */
 export function integrateStreamline(
-  grid: VectorGrid,
+  backend: FieldBackend,
   seed: Vec3,
   params: IntegratorParams,
   meta: { seedId: string; version: number; color: string; label: string },
 ): StreamlineResult {
   const start = performance.now();
-  const fieldEpoch = (grid as unknown as { epoch?: number }).epoch ?? 0;
+  const fieldEpoch = backend.epoch;
 
-  const forward = integrateDirection(seed, { direction: 1, params, grid });
+  const forward = integrateDirection(seed, { direction: 1, params, backend });
   const backward =
     params.direction === 'both'
-      ? integrateDirection(seed, { direction: -1, params, grid })
+      ? integrateDirection(seed, { direction: -1, params, backend })
       : null;
 
   // Assemble: reverse the backward direction, then the forward direction.
@@ -399,7 +438,7 @@ export function integrateStreamline(
   const speeds = new Float32Array(n);
   const times = new Float32Array(n);
   const arcs = new Float32Array(n);
-  const scalarNames = Object.keys(grid.scalars).sort();
+  const scalarNames = [...backend.scalarNames];
   const scalars: Record<string, Float32Array> = {};
   for (const name of scalarNames) scalars[name] = new Float32Array(n);
 
@@ -445,7 +484,9 @@ export function integrateStreamline(
     seedId: meta.seedId,
     version: meta.version,
     fieldEpoch,
-    fieldId: grid.meta.id,
+    fieldId: backend.meta.id,
+    fieldProtocolVersion: backend.protocolVersion,
+    fieldBackendKind: backend.kind,
     seed: vec3(seed.x, seed.y, seed.z),
     positions,
     velocities,
@@ -474,23 +515,35 @@ export interface HazardProbe {
   expected: StopReason;
 }
 
-/** Build default probes from mask geometry; field-specific probes should be supplied by the caller. */
-export function maskHazardProbes(grid: VectorGrid): HazardProbe[] {
-  const [nx, ny, nz] = grid.dims;
+/** Build default probes from backend mask geometry; field-specific probes should be supplied by the caller. */
+export function maskHazardProbes(backend: FieldBackend): HazardProbe[] {
+  const [nx, ny, nz] = backend.dims;
+  const spacing = backend.stats.spacing;
+  const origin = backend.extent.min;
   const probes: HazardProbe[] = [
     {
       key: 'out-of-bounds',
       label: '越界种子',
-      seed: vec3(grid.spec.origin.x - 3 * grid.spec.spacing.x, grid.spec.origin.y + 0.5 * grid.spec.spacing.y, grid.spec.origin.z + 0.5 * grid.spec.spacing.z),
+      seed: vec3(origin.x - 3 * spacing.x, origin.y + 0.5 * spacing.y, origin.z + 0.5 * spacing.z),
       expected: 'seed-invalid',
     },
   ];
+  // A missing chunk is its own hazard class: a seed inside it must be rejected
+  // as unavailable, not accepted with a zero-velocity field.
+  const gap = backend.maskBoxes().find((box) => box.kind === 'missing-chunk');
+  if (gap) {
+    probes.push({
+      key: 'missing-chunk',
+      label: '缺块中心种子',
+      seed: vec3((gap.min.x + gap.max.x) / 2, (gap.min.y + gap.max.y) / 2, (gap.min.z + gap.max.z) / 2),
+      expected: 'seed-invalid',
+    });
+  }
   for (let k = 0; k < nz - 1; k++) {
     for (let j = 0; j < ny - 1; j++) {
       for (let i = 0; i < nx - 1; i++) {
-        const c = grid.cellIndex(i, j, k);
-        if (grid.cellMissing[c]) {
-          probes.push({ key: 'missing-data', label: '缺测单元', seed: grid.cellCenter(i, j, k), expected: 'seed-invalid' });
+        if (backend.cellState(i, j, k) === 'missing-data') {
+          probes.push({ key: 'missing-data', label: '缺测单元', seed: backend.cellCenter(i, j, k), expected: 'seed-invalid' });
           return probes;
         }
       }
@@ -521,7 +574,7 @@ export interface HazardRunOptions {
 
 /** Runs bounded hazard probes. A probe exceeding the wall-clock budget fails. */
 export function runHazardChecks(
-  grid: VectorGrid,
+  backend: FieldBackend,
   baseParams: IntegratorParams,
   probes: HazardProbe[],
   opts: HazardRunOptions = {},
@@ -545,8 +598,8 @@ export function runHazardChecks(
     let time = 0;
     let bounded = true;
     try {
-      const fwd = integrateDirection(probe.seed, { direction: 1, params, grid });
-      const bwd = integrateDirection(probe.seed, { direction: -1, params, grid });
+      const fwd = integrateDirection(probe.seed, { direction: 1, params, backend });
+      const bwd = integrateDirection(probe.seed, { direction: -1, params, backend });
       stop = fwd.stop === 'seed-invalid' ? bwd.stop : fwd.stop;
       detail = fwd.stop === 'seed-invalid' ? bwd.stopDetail : fwd.stopDetail;
       steps = fwd.steps + bwd.steps;
@@ -557,6 +610,9 @@ export function runHazardChecks(
     }
     const elapsedMs = performance.now() - start;
     if (elapsedMs > budget) bounded = false;
+    // A hazard probe must end in a specific terminal state, not by running out
+    // of steps or failing numerically. Mirrors the pre-migration contract while
+    // adding missing-chunk as a legitimate boundary outcome.
     const terminal = stop !== 'max-steps' && stop !== 'numerical' && stop !== 'ok';
     const matchesExpectation = stop === probe.expected;
     const passed = bounded && terminal;

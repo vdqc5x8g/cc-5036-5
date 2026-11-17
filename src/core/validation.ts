@@ -1,4 +1,6 @@
 import { VectorGrid } from './grid';
+import { adapterForLegacyGrid } from './fieldFactory';
+import type { FieldBackend } from './fieldProtocol';
 import { integrateStreamline } from './integrator';
 import * as syntheticModule from './synthetic';
 import {
@@ -12,7 +14,8 @@ import { distance, IntegratorParams, ValidationReport, ValidationRow, Vec3, vec3
 
 export interface ValidationOptions {
   fieldKind: SyntheticFieldId;
-  grid: VectorGrid;
+  /** Backend used for the app trajectory (dense, chunked or legacy adapter). */
+  backend: FieldBackend;
   params: IntegratorParams;
   seeds: Vec3[];
   toleranceMeters: number;
@@ -21,8 +24,8 @@ export interface ValidationOptions {
 }
 
 /** Build a 3x-refined sampling of the same synthetic field, without mask gaps. */
-function refinedGridFor(fieldKind: SyntheticFieldId, spacing: Vec3): VectorGrid {
-  return new VectorGrid(syntheticModule.makeRefinedField(fieldKind, spacing.x));
+export function refinedGridBackend(fieldKind: SyntheticFieldId, spacing: Vec3): FieldBackend {
+  return adapterForLegacyGrid(new VectorGrid(syntheticModule.makeRefinedField(fieldKind, spacing.x)));
 }
 
 
@@ -152,7 +155,7 @@ function mergeBothDirections(
 }
 
 export function runValidation(opts: ValidationOptions): ValidationReport {
-  const { fieldKind, grid, params, seeds, toleranceMeters } = opts;
+  const { fieldKind, backend, params, seeds, toleranceMeters } = opts;
   const analytic = analyticVelocityFunction(fieldKind);
   const rows: ValidationRow[] = [];
   let maxError = 0;
@@ -161,7 +164,7 @@ export function runValidation(opts: ValidationOptions): ValidationReport {
 
   for (let i = 0; i < seeds.length; i++) {
     const seed = seeds[i];
-    const result = integrateStreamline(grid, seed, params, {
+    const result = integrateStreamline(backend, seed, params, {
       seedId: `val-${i}`,
       version: 0,
       color: '#ffffff',
@@ -220,7 +223,8 @@ export function runValidation(opts: ValidationOptions): ValidationReport {
     let refinement: { maxError: number; note: string } | null = null;
     if (opts.includeRefinement && fieldKind !== 'hyperbolic') {
       try {
-        const fine = refinedGridFor(fieldKind, grid.spec.spacing);
+        const fineSpacing = backend.stats.spacing;
+        const fine = refinedGridBackend(fieldKind, fineSpacing);
         const fineResult = integrateStreamline(fine, seed, params, {
           seedId: `val-fine-${i}`,
           version: 0,
@@ -231,7 +235,7 @@ export function runValidation(opts: ValidationOptions): ValidationReport {
           const fineRef = arcMatchedDeviation(fineResult.positions, fineResult.arcs, reference);
           refinement = {
             maxError: fineRef.maxError,
-            note: `3× 细化网格（Δ=${fine.spec.spacing.x.toFixed(3)} m）同参数重算`,
+            note: `3× 细化网格（Δ=${fineSpacing.x.toFixed(3)} m）同参数重算`,
           };
           note += ' “细化网格”指标用于区分网格插值误差与积分方法误差；若偏差未明显下降，说明限制精度的是积分/相位而非网格分辨率。';
         }
@@ -304,8 +308,8 @@ export function runValidation(opts: ValidationOptions): ValidationReport {
   // not condemn the implementation: there is nothing numerical to compare.
   const passed = validRows.length > 0 && validRows.every(rowPasses);
   return {
-    fieldId: grid.meta.id,
-    fieldName: grid.meta.name,
+    fieldId: backend.meta.id,
+    fieldName: backend.meta.name,
     ranAt: new Date().toISOString(),
     method: `逐采样点按累计弧长对齐到独立参考轨迹；通过判据为最大偏差 ≤ ${toleranceMeters} m 或相对误差 ≤ ${(relTolerance * 100).toFixed(1)}%（长闭环路径按后者）。${opts.fieldKind === 'hyperbolic' ? '参考为精确流映射。' : '参考为连续解析场 0.004 m 步长 RK4。'}`,
     params: { ...params },

@@ -1,5 +1,6 @@
 import { AppState, SeedRecord, STOP_TEXT } from '../state/store';
 import { StopReason, STOP_LABEL_ZH } from '../core/types';
+import { FIELD_BACKEND_PROTOCOL_LABEL, type FieldBackendKind } from '../core/fieldProtocol';
 
 export interface LeftPanelHandlers {
   onSeedSelect: (id: string) => void;
@@ -13,6 +14,12 @@ export interface LeftPanelHandlers {
   onRunHazards: () => void;
 }
 
+const BACKEND_KIND_LABEL: Record<FieldBackendKind, string> = {
+  dense: '稠密·显式坐标 v2',
+  chunked: '分块存储 v2',
+  'legacy-grid': '旧场适配器 v1→v2',
+};
+
 const stopClass: Record<StopReason, string> = {
   ok: 'ok',
   'seed-invalid': 'error',
@@ -21,6 +28,7 @@ const stopClass: Record<StopReason, string> = {
   'max-time': 'warn',
   'out-of-bounds': 'neutral',
   'missing-data': 'warn',
+  'missing-chunk': 'warn',
   solid: 'neutral',
   stagnation: 'ok',
   'closed-loop': 'ok',
@@ -113,7 +121,7 @@ export class LeftPanel {
       )
       .join('|');
     return [
-      state.fieldPayload.meta.id,
+      state.backend.meta.id,
       state.fieldEpoch,
       state.selectedSeedId,
       seedKey,
@@ -125,8 +133,8 @@ export class LeftPanel {
   }
 
   private render(state: AppState, keepEditing: boolean) {
-    const meta = state.fieldPayload.meta;
-    const stats = state.grid.stats;
+    const meta = state.backend.meta;
+    const stats = state.backend.stats;
     const ext = stats.extent;
     const missingBounds = stats.missingBounds;
     const missingText = missingBounds
@@ -150,12 +158,22 @@ export class LeftPanel {
         <dl class="field-grid">
           <dt>来源</dt><dd>${escapeHtml(meta.source)}</dd>
           <dt>出处</dt><dd>${escapeHtml(meta.provenance)}</dd>
+          <dt>场接口</dt><dd data-testid="protocol-version">${FIELD_BACKEND_PROTOCOL_LABEL} · ${BACKEND_KIND_LABEL[stats.backendKind]}${stats.chunkCount ? `（${stats.presentChunkCount}/${stats.chunkCount} 块）` : ''}</dd>
           <dt>节点 / 单元</dt><dd>${fmtInt(stats.nodeCount)} / ${fmtInt(stats.cellCount)}</dd>
           <dt>范围</dt><dd>x ${ext.min.x.toFixed(1)}–${ext.max.x.toFixed(1)}<br/>y ${ext.min.y.toFixed(1)}–${ext.max.y.toFixed(1)}<br/>z ${ext.min.z.toFixed(1)}–${ext.max.z.toFixed(1)} m</dd>
-          <dt>间距 Δ</dt><dd>${stats.spacing.x.toFixed(3)} / ${stats.spacing.y.toFixed(3)} / ${stats.spacing.z.toFixed(3)} m</dd>
+          <dt>间距 Δ</dt><dd>${
+            stats.axesUniform.every(Boolean)
+              ? `${stats.spacing.x.toFixed(3)} / ${stats.spacing.y.toFixed(3)} / ${stats.spacing.z.toFixed(3)} m`
+              : `非等距：x ${stats.axisSpacing.min.x.toFixed(3)}–${stats.axisSpacing.max.x.toFixed(3)}, y ${stats.axisSpacing.min.y.toFixed(3)}–${stats.axisSpacing.max.y.toFixed(3)}, z ${stats.axisSpacing.min.z.toFixed(3)}–${stats.axisSpacing.max.z.toFixed(3)} m`
+          }</dd>
           <dt>速度范围</dt><dd>${stats.speedMin.toFixed(3)} – ${stats.speedMax.toFixed(3)} m/s</dd>
           <dt>时间</dt><dd>${escapeHtml(meta.timeLabel)}</dd>
           <dt>缺测单元</dt><dd>${stats.missingCellCount}（${(stats.missingCellFraction * 100).toFixed(1)}%）</dd>
+          ${
+            stats.chunkCount
+              ? `<dt>缺块</dt><dd data-testid="missing-chunk-stat">${stats.missingChunkCount}/${stats.chunkCount} 块（${(stats.missingChunkFraction * 100).toFixed(1)}%）；缺块按覆盖缺口处理，不计为零速度</dd>`
+              : ''
+          }
         </dl>
         ${
           meta.synthetic

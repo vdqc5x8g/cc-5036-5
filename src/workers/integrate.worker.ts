@@ -1,12 +1,13 @@
 /// <reference lib="webworker" />
-import { FieldPayload, VectorGrid } from '../core/grid';
+import { createFieldBackend } from '../core/fieldFactory';
+import type { FieldBackend, FieldInput } from '../core/fieldProtocol';
 import { HazardProbe, integrateStreamline, runHazardChecks } from '../core/integrator';
 import { IntegratorParams, StreamlineResult, Vec3 } from '../core/types';
 import { runValidation, ValidationOptions } from '../core/validation';
 import { SyntheticFieldId } from '../core/synthetic';
 
 export type WorkerRequest =
-  | { type: 'init'; requestId: number; field: FieldPayload }
+  | { type: 'init'; requestId: number; field: FieldInput; epoch?: number }
   | {
       type: 'integrate';
       requestId: number;
@@ -28,7 +29,14 @@ export type WorkerRequest =
   | { type: 'hazards'; requestId: number; generation: number; probes: HazardProbe[]; params: IntegratorParams };
 
 export type WorkerResponse =
-  | { type: 'ready'; requestId: number; fieldId: string; epoch: number }
+  | {
+      type: 'ready';
+      requestId: number;
+      fieldId: string;
+      epoch: number;
+      protocolVersion: number;
+      backendKind: string;
+    }
   | { type: 'integrated'; requestId: number; generation: number; epoch: number; results: StreamlineResult[]; ms: number }
   | {
       type: 'validated';
@@ -48,7 +56,7 @@ export type WorkerResponse =
     }
   | { type: 'error'; requestId: number; message: string };
 
-let grid: VectorGrid | null = null;
+let backend: FieldBackend | null = null;
 let fieldEpoch = 0;
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
@@ -58,20 +66,22 @@ ctx.onmessage = (ev: MessageEvent<WorkerRequest>) => {
   try {
     switch (msg.type) {
       case 'init': {
-        grid = new VectorGrid(msg.field);
-        fieldEpoch = (msg.field as FieldPayload & { epoch?: number }).epoch ?? 0;
-        grid.epoch = fieldEpoch;
+        backend = createFieldBackend(msg.field);
+        fieldEpoch = msg.epoch ?? 0;
+        backend.epoch = fieldEpoch;
         const response: WorkerResponse = {
           type: 'ready',
           requestId: msg.requestId,
-          fieldId: grid.meta.id,
+          fieldId: backend.meta.id,
           epoch: fieldEpoch,
+          protocolVersion: backend.protocolVersion,
+          backendKind: backend.kind,
         };
         ctx.postMessage(response);
         break;
       }
       case 'integrate': {
-        if (!grid) throw new Error('worker 尚未载入场数据');
+        if (!backend) throw new Error('worker 尚未载入场数据');
         if (msg.epoch !== fieldEpoch) {
           // Stale field: refuse rather than return results from the wrong grid.
           ctx.postMessage({
@@ -81,9 +91,10 @@ ctx.onmessage = (ev: MessageEvent<WorkerRequest>) => {
           } satisfies WorkerResponse);
           break;
         }
+        const b = backend;
         const start = performance.now();
         const results = msg.jobs.map((job) =>
-          integrateStreamline(grid!, job.seed, job.params, {
+          integrateStreamline(b, job.seed, job.params, {
             seedId: job.seedId,
             version: job.version,
             color: job.color,
@@ -101,12 +112,12 @@ ctx.onmessage = (ev: MessageEvent<WorkerRequest>) => {
         break;
       }
       case 'validate': {
-        if (!grid) throw new Error('worker 尚未载入场数据');
+        if (!backend) throw new Error('worker 尚未载入场数据');
         if (msg.epoch !== fieldEpoch) throw new Error('场版本不匹配，拒绝校验');
         const start = performance.now();
         const options: ValidationOptions = {
           fieldKind: msg.fieldKind,
-          grid,
+          backend,
           params: msg.params,
           seeds: msg.seeds,
           toleranceMeters: msg.tolerance,
@@ -124,9 +135,9 @@ ctx.onmessage = (ev: MessageEvent<WorkerRequest>) => {
         break;
       }
       case 'hazards': {
-        if (!grid) throw new Error('worker 尚未载入场数据');
+        if (!backend) throw new Error('worker 尚未载入场数据');
         const start = performance.now();
-        const { checks, allBounded } = runHazardChecks(grid, msg.params, msg.probes, { timeBudgetMs: 2500 });
+        const { checks, allBounded } = runHazardChecks(backend, msg.params, msg.probes, { timeBudgetMs: 2500 });
         ctx.postMessage({
           type: 'hazards',
           requestId: msg.requestId,

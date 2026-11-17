@@ -123,6 +123,10 @@ export class RightPanel {
       selected?.result?.stop.forward ?? '-',
       selected?.result?.stop.backward ?? '-',
       selected?.result?.seedId ?? '-',
+      selected?.result?.version ?? '-',
+      selected?.result?.params.stepLength ?? '-',
+      selected?.result?.positions.length ?? '-',
+      selected?.computing,
       selected?.visible,
       val ? `${val.ranAt}:${val.summary.passed}:${val.rows.length}` : 'noval',
       state.seeds.length,
@@ -135,7 +139,7 @@ export class RightPanel {
   private render(state: AppState) {
     const p = state.params;
     const selected = state.seeds.find((s) => s.id === state.selectedSeedId) ?? null;
-    const scalarOptions = ['速度', ...Object.keys(state.grid.scalars).filter((n) => n !== 'speed')];
+    const scalarOptions = ['速度', ...state.backend.scalarNames.filter((n) => n !== 'speed')];
     const scale = this.scaleFor(state);
     const unit = this.unitFor(state);
 
@@ -274,13 +278,15 @@ export class RightPanel {
     return `
       <div class="seed-detail" data-testid="selected-detail">
         <div class="detail-row"><span class="detail-k">种子</span><span class="detail-v">${escapeHtml(seed.label)} · ${seed.position.x.toFixed(3)}, ${seed.position.y.toFixed(3)}, ${seed.position.z.toFixed(3)} m</span></div>
-        <div class="detail-row"><span class="detail-k">正向停止</span><span class="detail-v">${stopLabel(result.stop.forward)}</span></div>
-        <div class="detail-row"><span class="detail-k">反向停止</span><span class="detail-v">${result.stop.backward ? stopLabel(result.stop.backward) : '未积分'}</span></div>
+        <div class="detail-row"><span class="detail-k">正向停止</span><span class="detail-v">${stopLabel(result.stop.forward)} · ${result.stats.directions.forward.category}${result.stats.directions.forward.bounded ? '' : ' · 未受限'}</span></div>
+        <div class="detail-row"><span class="detail-k">反向停止</span><span class="detail-v">${result.stop.backward ? `${stopLabel(result.stop.backward)} · ${result.stats.directions.backward?.category ?? ''}` : '未积分'}</span></div>
         <div class="detail-row"><span class="detail-k">采样 / 步数</span><span class="detail-v">${fmtInt(n)} / ${fmtInt(result.stats.totalSteps)}</span></div>
         <div class="detail-row"><span class="detail-k">弧长 / 时间</span><span class="detail-v">${result.stats.totalArc.toFixed(2)} m / ${result.stats.totalTime.toFixed(2)} s</span></div>
         <div class="detail-row"><span class="detail-k">步长 min/mean/max</span><span class="detail-v">${fmtSci(result.stats.minStep)} / ${result.stats.meanStep.toFixed(3)} / ${result.stats.maxStep.toFixed(3)} m</span></div>
         <div class="detail-row"><span class="detail-k">场求值次数</span><span class="detail-v">${fmtInt(result.stats.totalEvals)}</span></div>
         <div class="detail-row"><span class="detail-k">计算耗时</span><span class="detail-v">${result.computationMs.toFixed(0)} ms</span></div>
+        <div class="detail-row"><span class="detail-k">本次参数</span><span class="detail-v" data-testid="used-params">Δs ${result.params.stepLength.toFixed(3)} m · 上限 ${result.params.maxSteps} 步 / ${result.params.maxArcLength.toFixed(0)} m · ${result.params.direction === 'both' ? '双向' : '单向'}</span></div>
+        <div class="detail-row"><span class="detail-k">场接口版本</span><span class="detail-v" data-testid="result-protocol">v${result.fieldProtocolVersion} · ${result.fieldBackendKind}</span></div>
       </div>
       <div class="stop-note" style="font-size:10px;color:var(--text-faint);line-height:1.5;margin-top:8px;font-family:var(--mono)">
         ${escapeHtml(result.stopDetail.forward)}${result.stopDetail.backward ? '<br/>' + escapeHtml(result.stopDetail.backward) : ''}
@@ -359,11 +365,11 @@ export class RightPanel {
   }
 
   private scaleFor(state: AppState): { min: number; max: number; name: ColormapName; label: string } {
-    const grid = state.grid;
+    const backend = state.backend;
     if (state.colorBy === '速度' || state.colorBy === 'speed') {
-      return { min: grid.stats.speedMin, max: grid.stats.speedMax, name: state.colormap, label: '速度' };
+      return { min: backend.stats.speedMin, max: backend.stats.speedMax, name: state.colormap, label: '速度' };
     }
-    const range = grid.stats.scalarRanges[state.colorBy];
+    const range = backend.stats.scalarRanges[state.colorBy];
     return {
       min: range?.min ?? 0,
       max: range?.max ?? 1,
@@ -374,7 +380,7 @@ export class RightPanel {
 
   private unitFor(state: AppState): string {
     if (state.colorBy === '速度' || state.colorBy === 'speed') return 'm/s';
-    return state.fieldPayload.meta.units.scalar?.[state.colorBy] ?? '';
+    return state.backend.meta.units.scalar?.[state.colorBy] ?? '';
   }
 
   private attachRangeLabels() {

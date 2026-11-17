@@ -38,6 +38,7 @@ export type StopReason =
   | 'max-time'
   | 'out-of-bounds'
   | 'missing-data'
+  | 'missing-chunk'
   | 'solid'
   | 'stagnation'
   | 'closed-loop'
@@ -51,13 +52,39 @@ export const STOP_LABEL_ZH: Record<StopReason, string> = {
   'max-time': '达到最大积分时间',
   'out-of-bounds': '离开网格范围',
   'missing-data': '进入缺测单元',
+  'missing-chunk': '进入缺块区域',
   solid: '接触固体/分离面',
   stagnation: '接近静止点',
   'closed-loop': '检测到闭环',
   numerical: '数值异常',
 };
 
-export type SampleReason = 'ok' | 'out-of-bounds' | 'missing-data' | 'solid';
+/**
+ * Coarse classification of why a trajectory stopped. Used by the UI and by
+ * evidence checks so a bounded terminal state is never confused with a limit
+ * that was silently hit.
+ */
+export type StopCategory = 'completed' | 'limit' | 'boundary' | 'topology' | 'invalid' | 'numerical';
+
+export const STOP_CATEGORY: Record<StopReason, StopCategory> = {
+  ok: 'completed',
+  'seed-invalid': 'invalid',
+  'max-steps': 'limit',
+  'max-length': 'limit',
+  'max-time': 'limit',
+  'out-of-bounds': 'boundary',
+  'missing-data': 'boundary',
+  'missing-chunk': 'boundary',
+  solid: 'boundary',
+  stagnation: 'topology',
+  'closed-loop': 'topology',
+  numerical: 'numerical',
+};
+
+/** A stop is bounded unless the numerical scheme itself failed. Limits are bounded by construction. */
+export const isBoundedStop = (stop: StopReason): boolean => stop !== 'numerical';
+
+export type SampleReason = 'ok' | 'out-of-bounds' | 'missing-data' | 'missing-chunk' | 'solid';
 
 export interface IntegratorParams {
   /** Requested output arc-length spacing, metres. */
@@ -94,6 +121,8 @@ export interface IntegrationDirectionResult {
   samples: Sample[];
   stop: StopReason;
   stopDetail: string;
+  category: StopCategory;
+  bounded: boolean;
   steps: number;
   evals: number;
   substepCount: number;
@@ -121,6 +150,10 @@ export interface StreamlineResult {
   version: number;
   fieldEpoch: number;
   fieldId: string;
+  /** Field-data interface version the trajectory was integrated through. */
+  fieldProtocolVersion: number;
+  /** Storage kind behind that interface ('dense' | 'chunked' | 'legacy-grid'). */
+  fieldBackendKind: string;
   seed: Vec3;
   positions: Float32Array;
   velocities: Float32Array;

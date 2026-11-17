@@ -8,7 +8,14 @@ import { LeftPanel } from './ui/leftPanel';
 import { RightPanel } from './ui/rightPanel';
 import { Vec3, vec3 } from './core/types';
 import { makeSyntheticField, SYNTHETIC_FIELD_IDS, SyntheticFieldId } from './core/synthetic';
+import { FIELD_BACKEND_PROTOCOL_LABEL, type FieldBackendKind } from './core/fieldProtocol';
 import { escapeHtml, fmt, fmtSci } from './util/format';
+
+const BACKEND_KIND_LABEL: Record<FieldBackendKind, string> = {
+  dense: '稠密·显式坐标',
+  chunked: '分块存储',
+  'legacy-grid': '旧场适配器',
+};
 
 const FIELD_LABELS: Record<SyntheticFieldId, string> = {
   uniform: '匀速参考流',
@@ -126,17 +133,26 @@ class FlowApp {
   }
 
   private buildFieldSwitch() {
-    this.ui.fieldSwitch.innerHTML = SYNTHETIC_FIELD_IDS.map(
+    const synthetic = SYNTHETIC_FIELD_IDS.map(
       (id) =>
         `<button class="field-chip synthetic-badge" data-field="${id}" type="button">${FIELD_LABELS[id]}</button>`,
-    ).join('');
+    );
+    // Chunked demo is an imported-kind field but has its own chip so the
+    // chunked backend is reachable from the UI, not only from a test hook.
+    synthetic.push(
+      `<button class="field-chip synthetic-badge" data-field="chunked-demo" type="button">分块 + 非等距</button>`,
+    );
+    this.ui.fieldSwitch.innerHTML = synthetic.join('');
     this.ui.fieldSwitch.addEventListener('click', (ev) => {
       const btn = (ev.target as HTMLElement).closest<HTMLElement>('[data-field]');
       if (!btn?.dataset.field) return;
-      const id = btn.dataset.field as SyntheticFieldId;
-      this.store.loadSyntheticField(id);
+      if (btn.dataset.field === 'chunked-demo') {
+        this.store.loadChunkedDemo();
+      } else {
+        this.store.loadSyntheticField(btn.dataset.field as SyntheticFieldId);
+      }
       this.placementZ = this.defaultPlacementZ();
-      this.viewer.setPlacementPlane(this.placementZ, this.store.getState().grid.extent);
+      this.viewer.setPlacementPlane(this.placementZ, this.store.getState().backend.extent);
       this.syncPlacementPlane();
     });
   }
@@ -151,7 +167,7 @@ class FlowApp {
         const json = JSON.parse(text);
         this.store.loadImportedField(json);
         this.placementZ = this.defaultPlacementZ();
-        this.viewer.setPlacementPlane(this.placementZ, this.store.getState().grid.extent);
+        this.viewer.setPlacementPlane(this.placementZ, this.store.getState().backend.extent);
         this.store.showToast(`已载入 ${file.name}：按给定网格值插值与积分，未做水动力实测校核。`, 'info', 5200);
       } catch (err) {
         this.store.showToast(`导入失败：${err instanceof Error ? err.message : String(err)}`, 'error', 6000);
@@ -160,13 +176,13 @@ class FlowApp {
       }
     });
     this.ui.recenterBtn.addEventListener('click', () => {
-      this.viewer.frameCamera(this.store.getState().grid);
+      this.viewer.frameCamera(this.store.getState().backend);
       this.viewer.requestRender();
     });
   }
 
   private defaultPlacementZ(): number {
-    const ext = this.store.getState().grid.extent;
+    const ext = this.store.getState().backend.extent;
     return (ext.min.z + ext.max.z) * 0.5;
   }
 
@@ -425,12 +441,14 @@ class FlowApp {
 
   // ---------- state → view ----------
 
-  private onState(state: AppState) {
+  private onState(_state: AppState) {
     if (this.rafPending) return;
     this.rafPending = true;
     requestAnimationFrame(() => {
       this.rafPending = false;
-      this.sync(state);
+      // Read the latest state here: an emit that arrived after this frame was
+      // scheduled must not be rendered from the older snapshot.
+      this.sync(this.store.getState());
     });
   }
 
@@ -451,7 +469,11 @@ class FlowApp {
 
   private syncFieldChips(state: AppState) {
     for (const chip of this.ui.fieldSwitch.querySelectorAll<HTMLElement>('[data-field]')) {
-      chip.classList.toggle('active', chip.dataset.field === state.fieldKind);
+      const active =
+        chip.dataset.field === 'chunked-demo'
+          ? state.backend.kind === 'chunked'
+          : state.backend.kind !== 'chunked' && chip.dataset.field === state.fieldKind;
+      chip.classList.toggle('active', active);
     }
   }
 
@@ -460,9 +482,9 @@ class FlowApp {
   private syncViewer(state: AppState) {
     if (state.fieldEpoch !== this.lastFieldEpoch) {
       this.lastFieldEpoch = state.fieldEpoch;
-      this.viewer.setField(state.grid);
+      this.viewer.setField(state.backend);
       this.placementZ = this.defaultPlacementZ();
-      this.viewer.setPlacementPlane(this.placementZ, state.grid.extent);
+      this.viewer.setPlacementPlane(this.placementZ, state.backend.extent);
     }
     // Remove visuals whose seeds disappeared.
     const seedIds = new Set(state.seeds.map((s) => s.id));
@@ -517,6 +539,7 @@ class FlowApp {
     this.viewer.handles.fieldGroup.traverse((obj) => {
       const kind = obj.userData?.maskKind;
       if (kind === 'missing') obj.visible = state.showMissing;
+      if (kind === 'missing-chunk') obj.visible = state.showMissing;
       if (kind === 'solid') obj.visible = state.showSolid;
     });
   }
@@ -541,20 +564,20 @@ class FlowApp {
   private colorScale(state: AppState): ColorScale {
     if (state.colorBy === '速度' || state.colorBy === 'speed') {
       return {
-        min: state.grid.stats.speedMin,
-        max: state.grid.stats.speedMax,
+        min: state.backend.stats.speedMin,
+        max: state.backend.stats.speedMax,
         name: state.colormap,
         label: '速度',
         unit: 'm/s',
       };
     }
-    const range = state.grid.stats.scalarRanges[state.colorBy];
+    const range = state.backend.stats.scalarRanges[state.colorBy];
     return {
       min: range?.min ?? 0,
       max: range?.max ?? 1,
       name: state.colormap,
       label: state.colorBy,
-      unit: state.fieldPayload.meta.units.scalar?.[state.colorBy] ?? '',
+      unit: state.backend.meta.units.scalar?.[state.colorBy] ?? '',
     };
   }
 
@@ -562,7 +585,7 @@ class FlowApp {
     const scale = this.colorScale(state);
     const status = state.status;
     const selected = state.seeds.find((s) => s.id === state.selectedSeedId);
-    const key = `${state.fieldEpoch}|${state.fieldPayload.meta.name}|${state.colorBy}|${state.colormap}|${status.active}|${status.lastMs}|${status.lastCount}|${selected?.id}|${state.seeds.length}|${state.params.stepLength}|${state.params.maxSteps}|${state.interacting}`;
+    const key = `${state.fieldEpoch}|${state.backend.meta.name}|${state.colorBy}|${state.colormap}|${status.active}|${status.lastMs}|${status.lastCount}|${selected?.id}|${state.seeds.length}|${state.params.stepLength}|${state.params.maxSteps}|${state.interacting}`;
     if (key === this.lastHudKey) {
       this.syncCameraHud();
       return;
@@ -570,7 +593,8 @@ class FlowApp {
     this.lastHudKey = key;
     const p = state.params;
     this.ui.computeHud.innerHTML = `
-      <div class="hud-row"><span class="hud-key">场</span><span class="hud-val">${escapeHtml(state.fieldPayload.meta.name)}</span></div>
+      <div class="hud-row"><span class="hud-key">场</span><span class="hud-val">${escapeHtml(state.backend.meta.name)}</span></div>
+      <div class="hud-row"><span class="hud-key">场接口 / 存储</span><span class="hud-val">${FIELD_BACKEND_PROTOCOL_LABEL} · ${BACKEND_KIND_LABEL[state.backend.kind]}</span></div>
       <div class="hud-row"><span class="hud-key">种子 / 流线</span><span class="hud-val">${state.seeds.length} / ${state.seeds.filter((s) => s.result).length}</span></div>
       <div class="hud-row"><span class="hud-key">步长 Δs / 最大步数</span><span class="hud-val">${p.stepLength.toFixed(3)} m / ${p.maxSteps}</span></div>
       <div class="hud-row"><span class="hud-key">容差 / 方向</span><span class="hud-val">${fmtSci(p.absTolerance, 1)} m / ${p.direction === 'both' ? '双向' : '单向'}</span></div>
@@ -606,7 +630,7 @@ class FlowApp {
 
   private syncPlacementPlane(state?: AppState) {
     const s = state ?? this.store.getState();
-    this.viewer.setPlacementPlane(this.placementZ, s.grid.extent);
+    this.viewer.setPlacementPlane(this.placementZ, s.backend.extent);
   }
 
   private syncTraceMarker() {
@@ -688,7 +712,7 @@ class FlowApp {
 
   private placeDemoSeeds() {
     const state = this.store.getState();
-    const ext = state.grid.extent;
+    const ext = state.backend.extent;
     const midZ = (ext.min.z + ext.max.z) / 2;
     const candidates: Vec3[] = [];
     const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
@@ -710,7 +734,7 @@ class FlowApp {
       );
     }
     for (const planned of candidates) {
-      const valid = state.grid.nearestValidPoint(planned);
+      const valid = state.backend.nearestValidPoint(planned);
       if (valid) this.store.addSeed(valid);
     }
     this.viewer.requestRender();

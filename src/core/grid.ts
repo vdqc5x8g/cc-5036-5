@@ -676,19 +676,3 @@ export function normalizeImport(raw: unknown): FieldPayload {
 
   return { meta, spec: { origin, spacing, dims }, velocity, scalars, nodeMissing, nodeSolid };
 }
-
-/** Serialise a payload for transfer; returns copies so the source grid remains usable. */
-export function copyPayloadForWorker(payload: FieldPayload): FieldPayload {
-  return {
-    meta: { ...payload.meta },
-    spec: {
-      origin: { ...payload.spec.origin },
-      spacing: { ...payload.spec.spacing },
-      dims: [...payload.spec.dims],
-    },
-    velocity: payload.velocity.slice(),
-    scalars: Object.fromEntries(Object.entries(payload.scalars).map(([k, v]) => [k, v.slice()])),
-    nodeMissing: payload.nodeMissing.slice(),
-    nodeSolid: payload.nodeSolid.slice(),
-  };
-}

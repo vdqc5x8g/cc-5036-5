@@ -5,7 +5,7 @@ async function appState(page: Page) {
     const state = window.__flowApp.store.getState();
     return {
       fieldEpoch: state.fieldEpoch,
-      fieldName: state.fieldPayload.meta.name,
+      fieldName: state.backend.meta.name,
       fieldKind: state.fieldKind,
       seeds: state.seeds.map((s) => ({
         id: s.id,
@@ -323,6 +323,8 @@ test('parameter changes re-integrate and the trace panel reports the used step s
   expect(after.params.stepLength).toBe(0.8);
   expect(after.seeds[0].samples).not.toBe(samplesBefore);
   await expect(page.locator('[data-testid="selected-section"]')).toContainText('步长 min/mean/max');
+  // The panel must name the parameters that actually produced this trajectory.
+  await expect(page.getByTestId('used-params')).toContainText('Δs 0.800 m');
 });
 
 test('validation against the analytic reference reports errors and refinement metric', async ({ page }) => {
@@ -360,7 +362,7 @@ test('imports a user grid JSON with masks and keeps the missing extent visible',
   await expect(section).toContainText('缺测网格范围');
   await expect(section).toContainText('示例数据');
   const stats = await page.evaluate(() => {
-    const g = window.__flowApp.store.getState().grid;
+    const g = window.__flowApp.store.getState().backend;
     return {
       dims: g.dims,
       missingCells: g.stats.missingCellCount,
@@ -401,4 +403,165 @@ test('hazard self-check covers stagnation, closed loop, missing data and out-of-
   const hState = await appState(page);
   expect(hState.hazards!.find((c) => c.key === 'missing-data')?.stop).toBe('seed-invalid');
   expect(hState.hazards!.find((c) => c.key === 'separation')?.passed).toBe(true);
+});
+
+test('exposes the field-data interface version and the active backend', async ({ page }) => {
+  await expect(page.getByTestId('protocol-version')).toContainText('v2');
+  await expect(page.getByTestId('protocol-version')).toContainText('旧场适配器');
+  await expect(page.locator('#compute-hud')).toContainText('v2');
+});
+
+test('non-uniform imported axes locate cells by coordinate and keep masks visible', async ({ page }) => {
+  await page.setInputFiles('#import-input', 'public/examples/nonuniform-demo.json');
+  await page.waitForFunction(
+    () => window.__flowApp.store.getState().fieldKind === 'imported',
+    undefined,
+    { timeout: 20_000 },
+  );
+  await expect(page.getByTestId('protocol-version')).toContainText('稠密');
+  await expect(page.locator('[data-testid="field-section"]')).toContainText('非等距');
+  const info = await page.evaluate(() => {
+    const b = window.__flowApp.store.getState().backend;
+    // A point away from the masked window, and one inside it.
+    const clear = b.sample({ x: 0, y: -3.5, z: 1.0 });
+    const inGap = b.sample({ x: 0, y: 0, z: 1.0 });
+    return {
+      kind: b.kind,
+      protocol: b.protocolVersion,
+      axesUniform: b.stats.axesUniform,
+      spacingMaxX: b.stats.axisSpacing.max.x,
+      spacingMinX: b.stats.axisSpacing.min.x,
+      sampleOk: clear.ok,
+      gapOk: inGap.ok,
+      gapReason: inGap.reason,
+      cellX: clear.cell[0],
+    };
+  });
+  expect(info.kind).toBe('dense');
+  expect(info.protocol).toBe(2);
+  expect(info.axesUniform).toEqual([false, false, true]);
+  // Non-uniform spacing is reported truthfully rather than collapsed to one value.
+  expect(info.spacingMaxX).toBeGreaterThan(info.spacingMinX);
+  expect(info.sampleOk).toBe(true);
+  expect(info.gapOk).toBe(false);
+  expect(info.gapReason).toBe('missing-data');
+});
+
+test('chunked demo: absent chunk is a coverage gap and stops the streamline as missing-chunk', async ({ page }) => {
+  await page.click('[data-field="chunked-demo"]');
+  await page.waitForFunction(
+    () => window.__flowApp.store.getState().backend.kind === 'chunked',
+    undefined,
+    { timeout: 20_000 },
+  );
+  await expect(page.getByTestId('protocol-version')).toContainText('分块存储');
+  await expect(page.getByTestId('missing-chunk-stat')).toContainText('1/27');
+
+  const gap = await page.evaluate(() => {
+    const b = window.__flowApp.store.getState().backend;
+    const box = b.maskBoxes().find((x) => x.kind === 'missing-chunk')!;
+    const p = {
+      x: (box.min.x + box.max.x) / 2,
+      y: (box.min.y + box.max.y) / 2,
+      z: (box.min.z + box.max.z) / 2,
+    };
+    const s = b.sample(p);
+    return { reason: s.reason, ok: s.ok, speed: s.speed, present: b.stats.presentChunkCount };
+  });
+  // The critical contract: a gap must not masquerade as zero velocity.
+  expect(gap.ok).toBe(false);
+  expect(gap.reason).toBe('missing-chunk');
+  expect(gap.present).toBe(26);
+
+  // Drive a real streamline from the UI into the gap and check the terminal state.
+  await page.evaluate(() => {
+    const store = window.__flowApp.store;
+    store.addSeed({ x: -4, y: 0, z: 1.5 }, { allowRelocate: true });
+  });
+  await page.waitForFunction(
+    () => window.__flowApp.store.getState().seeds.some((s) => s.result !== null),
+    undefined,
+    { timeout: 20_000 },
+  );
+  const result = await page.evaluate(() => {
+    const seed = window.__flowApp.store.getState().seeds.find((s) => s.result) ?? window.__flowApp.store.getState().seeds[0];
+    const r = seed.result!;
+    return {
+      stop: r.stop.forward,
+      category: r.stats.directions.forward.category,
+      bounded: r.stats.directions.forward.bounded,
+      detail: r.stopDetail.forward,
+      samples: r.positions.length / 3,
+    };
+  });
+  expect(result.stop).toBe('missing-chunk');
+  expect(result.category).toBe('boundary');
+  expect(result.bounded).toBe(true);
+  expect(result.detail).toContain('缺块');
+  expect(result.samples).toBeGreaterThan(3);
+
+  // Every recorded sample must still be valid data (the stop is not stepped into).
+  const allValid = await page.evaluate(() => {
+    const s = window.__flowApp.store.getState();
+    const r = s.seeds.find((x) => x.result)!.result!;
+    for (let i = 0; i < r.positions.length / 3; i++) {
+      const p = { x: r.positions[3 * i], y: r.positions[3 * i + 1], z: r.positions[3 * i + 2] };
+      if (!s.backend.sample(p).ok) return false;
+    }
+    return true;
+  });
+  expect(allValid).toBe(true);
+});
+
+test('streamline interaction reports how it failed, not a silent stuck spinner', async ({ page }) => {
+  // Force the worker path to fail after a request is in flight: the failure
+  // must propagate to the seed record (no seed may stay "computing" forever).
+  await page.evaluate(() => window.__flowApp.store.updateParams({ stepLength: 0.3, maxArcLength: 30 }));
+  await clickCanvas(page, 0.5, 0.6);
+  await page.waitForFunction(
+    () => window.__flowApp.store.getState().seeds.some((s) => s.result !== null),
+    undefined,
+    { timeout: 20_000 },
+  );
+  const before = await appState(page);
+  const seedId = before.seeds[0].id;
+
+  const after = await page.evaluate((id) => {
+    const store = window.__flowApp.store as unknown as {
+      onWorkerFailureForTest?: (message: string) => void;
+    };
+    store.onWorkerFailureForTest?.('模拟积分线程失败');
+    const seed = window.__flowApp.store.getState().seeds.find((s) => s.id === id)!;
+    return {
+      computing: seed.computing,
+      stop: seed.lastStop?.forward ?? null,
+      detail: seed.result?.stopDetail.forward ?? '',
+      statusError: window.__flowApp.store.getState().status.error,
+    };
+  }, seedId);
+
+  expect(after.computing).toBe(false);
+  expect(after.stop).toBe('numerical');
+  expect(after.detail).toContain('模拟积分线程失败');
+  expect(after.statusError).toContain('模拟积分线程失败');
+});
+
+test('each trajectory is stamped with the field-data interface version it ran through', async ({ page }) => {
+  await clickCanvas(page, 0.5, 0.55);
+  await page.waitForFunction(
+    () => window.__flowApp.store.getState().seeds.some((s) => s.result !== null),
+    undefined,
+    { timeout: 20_000 },
+  );
+  const stamped = await page.evaluate(() => {
+    const seed = window.__flowApp.store.getState().seeds.find((s) => s.result)!;
+    const r = seed.result!;
+    return { version: r.fieldProtocolVersion, kind: r.fieldBackendKind, backend: window.__flowApp.store.getState().backend.protocolVersion };
+  });
+  expect(stamped.version).toBe(2);
+  expect(stamped.backend).toBe(2);
+  // Legacy synthetic fields run through the adapter, and say so.
+  expect(stamped.kind).toBe('legacy-grid');
+  await expect(page.getByTestId('result-protocol')).toContainText('v2');
+  await expect(page.getByTestId('result-protocol')).toContainText('legacy-grid');
 });
